@@ -14,7 +14,7 @@
 2. 谷歌浏览器（Chromium内核）
 ## 安装步骤
 1. 克隆本仓库
-<pre><code>git clone https://github.com/yourusername/douyin-image-downloader.git
+<pre><code>git clone https://github.com/HuhuMiwu/douyin-image-downloader.git
 
 cd douyin-image-downloader</code></pre>
 2. 创建并激活虚拟环境
