@@ -1,0 +1,206 @@
+# -
+import os
+import re
+import requests
+import csv
+import logging
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from DrissionPage import ChromiumPage
+
+# 配置日志系统
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('downloader.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 全局配置
+DOWNLOAD_FOLDER = 'downloaded_images'
+CSV_FILE = 'image_info.csv'
+MAX_THREADS = 5
+DOWNLOADED_IDS_FILE = 'downloaded_ids.txt'
+
+# 创建下载目录
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+class DouyinImageDownloader:
+    def __init__(self):
+        self.dp = None
+        self.downloaded_ids = self.load_downloaded_ids()
+        self.init_csv_file()
+
+    def load_downloaded_ids(self):
+        """加载已下载的图片ID，避免重复下载"""
+        if os.path.exists(DOWNLOADED_IDS_FILE):
+            with open(DOWNLOADED_IDS_FILE, 'r', encoding='utf-8') as f:
+                return set(line.strip() for line in f)
+        return set()
+
+    def save_downloaded_id(self, image_id):
+        """保存已下载的图片ID"""
+        with open(DOWNLOADED_IDS_FILE, 'a', encoding='utf-8') as f:
+            f.write(f'{image_id}\n')
+        self.downloaded_ids.add(image_id)
+
+    def init_csv_file(self):
+        """初始化CSV文件"""
+        if not os.path.exists(CSV_FILE):
+            with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['author', 'target_id', 'image_url'])
+
+    def log_to_csv(self, image_info):
+        """记录图片信息到CSV文件"""
+        with open(CSV_FILE, 'a', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                image_info['author'],
+                image_info['target_id'],
+                image_info['image_url']
+            ])
+
+    def init_browser(self):
+        """初始化浏览器并设置监听器"""
+        try:
+            self.dp = ChromiumPage()
+            self.dp.listen.start('v1/web/aweme/listcollection/')
+            self.dp.get('https://www.douyin.com/user/self?from_tab_name=main&showTab=favorite_collection')
+            logger.info('浏览器初始化完成')
+            return True
+        except Exception as e:
+            logger.error(f'浏览器初始化失败: {str(e)}')
+            return False
+
+    def collect_image_info(self, max_pages=200):
+        """采集图片信息"""
+        if not self.dp:
+            logger.error('浏览器未初始化')
+            return []
+
+        image_info_list = []
+
+        for page in range(1, max_pages + 1):
+            try:
+                r = self.dp.listen.wait()
+                logger.info(f'正在采集第{page}页')
+                json_data = r.response.body
+
+                info_list = json_data.get('aweme_list', [])
+                if not info_list:
+                    logger.info('未找到aweme_list，结束采集。')
+                    break
+
+                for item in info_list:
+                    try:
+                        target_id = item['aweme_id']
+                        author = item['author']['nickname']
+                        # 清理文件名特殊字符
+                        nickname = re.sub(r'[\\/:*?"<>|]', '', author)
+                        images = item.get('images')
+
+                        if not images:
+                            logger.warning(f'作品{target_id}没有图片，跳过')
+                            continue
+
+                        logger.info(f'正在处理【{author}】的作品 {target_id}')
+                        for idx, image in enumerate(images):
+                            image_url = image['url_list'][-1]
+                            image_id = f'{target_id}_{idx+1}'
+                            if image_id in self.downloaded_ids:
+                                logger.info(f'图片 {image_id} 已下载，跳过')
+                                continue
+
+                            image_info_list.append({
+                                'author': author,
+                                'nickname': nickname,
+                                'target_id': target_id,
+                                'image_id': image_id,
+                                'image_url': image_url
+                            })
+                    except Exception as e:
+                        logger.error(f'处理作品时出错: {str(e)}', exc_info=True)
+                        continue
+
+                # 滚动加载更多
+                self.dp.scroll.to_see('css:.gqga5U3W')
+                # 随机等待1-3秒
+                time.sleep(random.uniform(1, 5))
+            except Exception as e:
+                logger.error(f'采集第{page}页时出错: {str(e)}', exc_info=True)
+                continue
+
+        return image_info_list
+
+    def download_image(self, image_info):
+        """下载单张图片"""
+        try:
+            response = requests.get(image_info['image_url'], timeout=15)
+            response.raise_for_status()
+
+            # 保存图片
+            filename = f"{image_info['nickname']}_{image_info['image_id']}.jpg"
+            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
+
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+
+            # 记录已下载ID和CSV信息
+            self.save_downloaded_id(image_info['image_id'])
+            self.log_to_csv(image_info)
+
+            logger.info(f'下载成功: {filename}')
+            return True
+        except Exception as e:
+            logger.error(f'下载 {image_info["image_url"]} 时出错: {str(e)}', exc_info=True)
+            return False
+
+    def download_images_multithreaded(self, image_info_list):
+        """多线程下载图片"""
+        if not image_info_list:
+            logger.info('没有图片需要下载')
+            return
+
+        logger.info(f'开始多线程下载，共{len(image_info_list)}张图片')
+        success_count = 0
+        fail_count = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = {executor.submit(self.download_image, info): info for info in image_info_list}
+
+            for future in as_completed(futures):
+                image_info = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.error(f'处理图片 {image_info.get("image_id")} 时出错: {str(e)}', exc_info=True)
+                
+        logger.info(f'下载完成: 成功 {success_count} 张, 失败 {fail_count} 张')
+
+    def start_download(self):
+        """启动下载流程"""
+        if not self.init_browser():
+            return
+
+        logger.info('开始采集图片信息')
+        image_info_list = self.collect_image_info()
+
+        if not image_info_list:
+            logger.info('没有找到可下载的图片信息')
+            return
+
+        self.download_images_multithreaded(image_info_list)
+
+if __name__ == '__main__':
+    downloader = DouyinImageDownloader()
+    downloader.start_download()
