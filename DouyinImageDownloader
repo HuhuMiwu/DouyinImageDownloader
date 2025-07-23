@@ -1,4 +1,3 @@
-# -
 import os
 import re
 import requests
@@ -6,8 +5,14 @@ import csv
 import logging
 import random
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from DrissionPage import ChromiumPage
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QTextEdit, QLabel, QLineEdit, QProgressBar,
+                             QGroupBox, QFileDialog, QCheckBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QIcon
 
 # 配置日志系统
 logging.basicConfig(
@@ -28,6 +33,7 @@ DOWNLOADED_IDS_FILE = 'downloaded_ids.txt'
 
 # 创建下载目录
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
 
 class DouyinImageDownloader:
     def __init__(self):
@@ -77,7 +83,7 @@ class DouyinImageDownloader:
             logger.error(f'浏览器初始化失败: {str(e)}')
             return False
 
-    def collect_image_info(self, max_pages=200):
+    def collect_image_info(self, max_pages=5):
         """采集图片信息"""
         if not self.dp:
             logger.error('浏览器未初始化')
@@ -93,7 +99,7 @@ class DouyinImageDownloader:
 
                 info_list = json_data.get('aweme_list', [])
                 if not info_list:
-                    logger.info('未找到aweme_list，结束采集。')
+                    logger.info('未找到aweme_list，结束采集。 ')
                     break
 
                 for item in info_list:
@@ -101,7 +107,7 @@ class DouyinImageDownloader:
                         target_id = item['aweme_id']
                         author = item['author']['nickname']
                         # 清理文件名特殊字符
-                        nickname = re.sub(r'[\\/:*?"<>|]', '', author)
+                        nickname = re.sub(r'[\\/:*?" <>|]', '', author)
                         images = item.get('images')
 
                         if not images:
@@ -111,7 +117,7 @@ class DouyinImageDownloader:
                         logger.info(f'正在处理【{author}】的作品 {target_id}')
                         for idx, image in enumerate(images):
                             image_url = image['url_list'][-1]
-                            image_id = f'{target_id}_{idx+1}'
+                            image_id = f'{target_id}_{idx + 1}'
                             if image_id in self.downloaded_ids:
                                 logger.info(f'图片 {image_id} 已下载，跳过')
                                 continue
@@ -160,17 +166,17 @@ class DouyinImageDownloader:
             logger.error(f'下载 {image_info["image_url"]} 时出错: {str(e)}', exc_info=True)
             return False
 
-    def download_images_multithreaded(self, image_info_list):
+    def download_images_multithreaded(self, image_info_list, max_threads=5):
         """多线程下载图片"""
         if not image_info_list:
             logger.info('没有图片需要下载')
-            return
+            return 0, 0
 
         logger.info(f'开始多线程下载，共{len(image_info_list)}张图片')
         success_count = 0
         fail_count = 0
 
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = {executor.submit(self.download_image, info): info for info in image_info_list}
 
             for future in as_completed(futures):
@@ -184,23 +190,242 @@ class DouyinImageDownloader:
                 except Exception as e:
                     fail_count += 1
                     logger.error(f'处理图片 {image_info.get("image_id")} 时出错: {str(e)}', exc_info=True)
-                
-        logger.info(f'下载完成: 成功 {success_count} 张, 失败 {fail_count} 张')
 
-    def start_download(self):
+        logger.info(f'下载完成: 成功 {success_count} 张, 失败 {fail_count} 张')
+        return success_count, fail_count
+
+    def start_download(self, max_pages=5, max_threads=5):
         """启动下载流程"""
         if not self.init_browser():
-            return
+            return 0, 0
 
         logger.info('开始采集图片信息')
-        image_info_list = self.collect_image_info()
+        image_info_list = self.collect_image_info(max_pages)
 
         if not image_info_list:
             logger.info('没有找到可下载的图片信息')
+            return 0, 0
+
+        return self.download_images_multithreaded(image_info_list, max_threads)
+
+
+class DownloadThread(QThread):
+    """执行下载任务的线程"""
+    update_log = pyqtSignal(str)
+    update_progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(int, int)
+    error = pyqtSignal(str)
+
+    def __init__(self, max_pages, max_threads):
+        super().__init__()
+        self.max_pages = max_pages
+        self.max_threads = max_threads
+        self.downloader = DouyinImageDownloader()
+
+        # 重定向日志到GUI
+        self.log_handler = self.GuiLogHandler(self.update_log)
+        logger.addHandler(self.log_handler)
+
+    class GuiLogHandler(logging.Handler):
+        """自定义日志处理器，将日志发送到GUI"""
+
+        def __init__(self, emit_signal):
+            super().__init__()
+            self.emit_signal = emit_signal
+
+        def emit(self, record):
+            log_entry = self.format(record)
+            self.emit_signal.emit(log_entry)
+
+    def run(self):
+        try:
+            success, fail = self.downloader.start_download(self.max_pages, self.max_threads)
+            self.finished.emit(success, fail)
+        except Exception as e:
+            self.error.emit(f"下载过程中发生错误: {str(e)}")
+        finally:
+            # 移除自定义日志处理器
+            logger.removeHandler(self.log_handler)
+
+
+class DouyinDownloaderApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("抖音图片下载器")
+        self.setGeometry(100, 100, 800, 600)
+        self.setWindowIcon(QIcon("icon.png"))  # 请准备一个图标文件
+
+        self.init_ui()
+        self.download_thread = None
+
+    def init_ui(self):
+        """初始化用户界面"""
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+
+        # 标题
+        title_label = QLabel("抖音图片下载器")
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #3498db; margin: 15px;")
+        main_layout.addWidget(title_label)
+
+        # 配置区域
+        config_group = QGroupBox("下载设置")
+        config_layout = QVBoxLayout()
+
+        # 下载页数设置
+        pages_layout = QHBoxLayout()
+        pages_layout.addWidget(QLabel("采集页数:"))
+        self.pages_input = QLineEdit("5")
+        self.pages_input.setMaximumWidth(50)
+        pages_layout.addWidget(self.pages_input)
+        pages_layout.addStretch()
+        config_layout.addLayout(pages_layout)
+
+        # 线程数设置
+        threads_layout = QHBoxLayout()
+        threads_layout.addWidget(QLabel("下载线程数:"))
+        self.threads_input = QLineEdit("5")
+        self.threads_input.setMaximumWidth(50)
+        threads_layout.addWidget(self.threads_input)
+        threads_layout.addStretch()
+        config_layout.addLayout(threads_layout)
+
+        # 下载目录设置
+        dir_layout = QHBoxLayout()
+        dir_layout.addWidget(QLabel("下载目录:"))
+        self.dir_input = QLineEdit(DOWNLOAD_FOLDER)
+        dir_layout.addWidget(self.dir_input)
+        self.browse_btn = QPushButton("浏览...")
+        self.browse_btn.setMaximumWidth(80)
+        self.browse_btn.clicked.connect(self.browse_directory)
+        dir_layout.addWidget(self.browse_btn)
+        config_layout.addLayout(dir_layout)
+
+        # 跳过已下载选项
+        self.skip_downloaded = QCheckBox("跳过已下载的图片")
+        self.skip_downloaded.setChecked(True)
+        config_layout.addWidget(self.skip_downloaded)
+
+        config_group.setLayout(config_layout)
+        main_layout.addWidget(config_group)
+
+        # 进度条
+        self.progress_label = QLabel("准备开始...")
+        self.progress_label.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.progress_bar)
+
+        # 控制按钮
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("开始下载")
+        self.start_btn.setStyleSheet("background-color: #2ecc71; color: white; padding: 8px;")
+        self.start_btn.clicked.connect(self.start_download)
+        btn_layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setStyleSheet("background-color: #e74c3c; color: white; padding: 8px;")
+        self.stop_btn.clicked.connect(self.stop_download)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+
+        main_layout.addLayout(btn_layout)
+
+        # 日志区域
+        log_group = QGroupBox("操作日志")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet("font-family: Consolas, Courier;")
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+        # 状态栏
+        self.statusBar().showMessage("准备就绪")
+
+    def browse_directory(self):
+        """选择下载目录"""
+        global DOWNLOAD_FOLDER  # 提前使用 global 声明
+        directory = QFileDialog.getExistingDirectory(self, "选择下载目录", DOWNLOAD_FOLDER)
+        if directory:
+            DOWNLOAD_FOLDER = directory
+            self.dir_input.setText(directory)
+
+    def start_download(self):
+        """开始下载过程"""
+        global DOWNLOAD_FOLDER  # 提前使用 global 声明
+        DOWNLOAD_FOLDER = self.dir_input.text()
+        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+        # 获取设置
+        try:
+            max_pages = int(self.pages_input.text())
+            max_threads = int(self.threads_input.text())
+        except ValueError:
+            self.log_text.append("错误：页数和线程数必须是整数")
             return
 
-        self.download_images_multithreaded(image_info_list)
+        # 更新UI状态
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在初始化...")
+
+        # 创建并启动下载线程
+        self.download_thread = DownloadThread(max_pages, max_threads)
+        self.download_thread.update_log.connect(self.update_log)
+        self.download_thread.update_progress.connect(self.update_progress)
+        self.download_thread.finished.connect(self.download_finished)
+        self.download_thread.error.connect(self.show_error)
+        self.download_thread.start()
+
+    def stop_download(self):
+        """停止下载过程"""
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.terminate()
+            self.log_text.append("下载已停止")
+            self.progress_label.setText("下载已停止")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+
+    def update_log(self, message):
+        """更新日志显示"""
+        self.log_text.append(message)
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    def update_progress(self, current, total, success):
+        """更新进度条"""
+        if total > 0:
+            progress = int((current / total) * 100)
+            self.progress_bar.setValue(progress)
+            self.progress_label.setText(f"正在下载: {current}/{total} (成功: {success})")
+
+    def download_finished(self, success, fail):
+        """下载完成处理"""
+        self.progress_bar.setValue(100)
+        self.progress_label.setText(f"下载完成! 成功: {success}, 失败: {fail}")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.log_text.append(f"下载完成! 成功下载 {success} 张图片，失败 {fail} 张")
+
+    def show_error(self, message):
+        """显示错误信息"""
+        self.log_text.append(f"<font color='red'>{message}</font>")
+        self.progress_label.setText("下载出错")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
 
 if __name__ == '__main__':
-    downloader = DouyinImageDownloader()
-    downloader.start_download()
+    app = QApplication(sys.argv)
+    window = DouyinDownloaderApp()
+    window.show()
+    sys.exit(app.exec_())
