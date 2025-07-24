@@ -1,18 +1,67 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+抖音图片下载器 - 修正版本
+解决了所有依赖和兼容性问题
+"""
+
 import os
 import re
-import requests
 import csv
 import logging
 import random
 import time
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from DrissionPage import ChromiumPage
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QTextEdit, QLabel, QLineEdit, QProgressBar,
-                             QGroupBox, QFileDialog, QCheckBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QIcon
+
+# 安全导入依赖包
+def safe_import():
+    """安全导入所有依赖"""
+    global requests, DRISSION_AVAILABLE, PYQT_AVAILABLE
+
+    # 导入requests
+    try:
+        import requests
+        print("✅ requests库可用")
+    except ImportError:
+        print("❌ requests库不可用，请安装: pip install requests")
+        return False
+
+    # 导入DrissionPage (可选)
+    try:
+        from DrissionPage import ChromiumPage
+        DRISSION_AVAILABLE = True
+        print("✅ DrissionPage可用")
+    except ImportError:
+        DRISSION_AVAILABLE = False
+        print("⚠️  DrissionPage不可用 (可选)")
+
+    # 导入PyQt5 (可选，用于GUI)
+    try:
+        from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                                 QPushButton, QTextEdit, QLabel, QLineEdit, QProgressBar,
+                                 QGroupBox, QFileDialog, QCheckBox, QFrame)
+        from PyQt5.QtCore import Qt, QThread, pyqtSignal
+        from PyQt5.QtGui import QFont
+        PYQT_AVAILABLE = True
+        print("✅ PyQt5可用 - 支持GUI模式")
+        return True
+    except ImportError:
+        PYQT_AVAILABLE = False
+        print("⚠️  PyQt5不可用 - 仅支持命令行模式")
+        print("   安装命令: pip install PyQt5")
+        return True  # 仍然可以运行命令行版本
+
+# 初始化导入
+if not safe_import():
+    print("❌ 关键依赖缺失，无法运行")
+    sys.exit(1)
+
+# 只有在PyQt5可用时才导入GUI组件
+if PYQT_AVAILABLE:
+    from PyQt5.QtWidgets import *
+    from PyQt5.QtCore import *
+    from PyQt5.QtGui import *
 
 # 配置日志系统
 logging.basicConfig(
@@ -73,7 +122,12 @@ class DouyinImageDownloader:
 
     def init_browser(self):
         """初始化浏览器并设置监听器"""
+        if not DRISSION_AVAILABLE:
+            logger.error('DrissionPage 未安装，无法使用浏览器自动化功能')
+            return False
+
         try:
+            from DrissionPage import ChromiumPage
             self.dp = ChromiumPage()
             self.dp.listen.start('v1/web/aweme/listcollection/')
             self.dp.get('https://www.douyin.com/user/self?from_tab_name=main&showTab=favorite_collection')
@@ -90,6 +144,12 @@ class DouyinImageDownloader:
             return []
 
         image_info_list = []
+
+        # 新增：允许用户输入滚动类名
+        scroll_class = getattr(self, 'scroll_class', None)
+        if not scroll_class:
+            scroll_class = 'gqga5U3W'  # 默认类名
+        scroll_selector = f'css:.{scroll_class}'
 
         for page in range(1, max_pages + 1):
             try:
@@ -134,7 +194,7 @@ class DouyinImageDownloader:
                         continue
 
                 # 滚动加载更多
-                self.dp.scroll.to_see('css:.gqga5U3W')
+                self.dp.scroll.to_see(scroll_selector)
                 # 随机等待1-3秒
                 time.sleep(random.uniform(1, 5))
             except Exception as e:
@@ -209,223 +269,424 @@ class DouyinImageDownloader:
         return self.download_images_multithreaded(image_info_list, max_threads)
 
 
-class DownloadThread(QThread):
-    """执行下载任务的线程"""
-    update_log = pyqtSignal(str)
-    update_progress = pyqtSignal(int, int, int)
-    finished = pyqtSignal(int, int)
-    error = pyqtSignal(str)
+# 只有在PyQt5可用时才定义GUI相关类
+if PYQT_AVAILABLE:
 
-    def __init__(self, max_pages, max_threads):
-        super().__init__()
-        self.max_pages = max_pages
-        self.max_threads = max_threads
-        self.downloader = DouyinImageDownloader()
+    class DownloadThread(QThread):
+        """执行下载任务的线程"""
+        update_log = pyqtSignal(str)
+        update_progress = pyqtSignal(int, int, int)
+        finished = pyqtSignal(int, int)
+        error = pyqtSignal(str)
 
-        # 重定向日志到GUI
-        self.log_handler = self.GuiLogHandler(self.update_log)
-        logger.addHandler(self.log_handler)
-
-    class GuiLogHandler(logging.Handler):
-        """自定义日志处理器，将日志发送到GUI"""
-
-        def __init__(self, emit_signal):
+        def __init__(self, max_pages, max_threads):
             super().__init__()
-            self.emit_signal = emit_signal
+            self.max_pages = max_pages
+            self.max_threads = max_threads
+            self.downloader = DouyinImageDownloader()
 
-        def emit(self, record):
-            log_entry = self.format(record)
-            self.emit_signal.emit(log_entry)
+            # 重定向日志到GUI
+            self.log_handler = self.GuiLogHandler(self.update_log)
+            logger.addHandler(self.log_handler)
 
-    def run(self):
-        try:
-            success, fail = self.downloader.start_download(self.max_pages, self.max_threads)
-            self.finished.emit(success, fail)
-        except Exception as e:
-            self.error.emit(f"下载过程中发生错误: {str(e)}")
-        finally:
-            # 移除自定义日志处理器
-            logger.removeHandler(self.log_handler)
+        class GuiLogHandler(logging.Handler):
+            """自定义日志处理器，将日志发送到GUI"""
 
+            def __init__(self, emit_signal):
+                super().__init__()
+                self.emit_signal = emit_signal
 
-class DouyinDownloaderApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("抖音图片下载器")
-        self.setGeometry(100, 100, 800, 600)
-        self.setWindowIcon(QIcon("icon.png"))  # 请准备一个图标文件
+            def emit(self, record):
+                log_entry = self.format(record)
+                self.emit_signal.emit(log_entry)
 
-        self.init_ui()
-        self.download_thread = None
+        def run(self):
+            try:
+                success, fail = self.downloader.start_download(self.max_pages, self.max_threads)
+                self.finished.emit(success, fail)
+            except Exception as e:
+                self.error.emit(f"下载过程中发生错误: {str(e)}")
+            finally:
+                # 移除自定义日志处理器
+                logger.removeHandler(self.log_handler)
 
-    def init_ui(self):
-        """初始化用户界面"""
-        main_widget = QWidget()
-        main_layout = QVBoxLayout()
+    class ModernButton(QPushButton):
+        """现代化按钮组件"""
+        def __init__(self, text, button_type="primary"):
+            super().__init__(text)
+            self.button_type = button_type
+            self.setFixedHeight(45)
+            self.setCursor(Qt.PointingHandCursor)
+            self.setStyleSheet(self.get_style())
 
-        # 标题
-        title_label = QLabel("抖音图片下载器")
-        title_label.setFont(QFont("Arial", 16, QFont.Bold))
-        title_label.setAlignment(Qt.AlignCenter)
-        title_label.setStyleSheet("color: #3498db; margin: 15px;")
-        main_layout.addWidget(title_label)
+        def get_style(self):
+            if self.button_type == "primary":
+                return """
+                    QPushButton {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #4CAF50, stop: 1 #45a049);
+                        border: none;
+                        border-radius: 22px;
+                        color: white;
+                        font-size: 14px;
+                        font-weight: bold;
+                        padding: 12px 24px;
+                    }
+                    QPushButton:hover {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #5CBF60, stop: 1 #4CAF50);
+                    }
+                    QPushButton:pressed {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #45a049, stop: 1 #3d8b40);
+                    }
+                    QPushButton:disabled {
+                        background: #cccccc;
+                        color: #666666;
+                    }
+                """
+            elif self.button_type == "danger":
+                return """
+                    QPushButton {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #f44336, stop: 1 #d32f2f);
+                        border: none;
+                        border-radius: 22px;
+                        color: white;
+                        font-size: 14px;
+                        font-weight: bold;
+                        padding: 12px 24px;
+                    }
+                    QPushButton:hover {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #f55a4e, stop: 1 #f44336);
+                    }
+                    QPushButton:pressed {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #d32f2f, stop: 1 #b71c1c);
+                    }
+                    QPushButton:disabled {
+                        background: #cccccc;
+                        color: #666666;
+                    }
+                """
+            else:  # secondary
+                return """
+                    QPushButton {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #2196F3, stop: 1 #1976D2);
+                        border: none;
+                        border-radius: 22px;
+                        color: white;
+                        font-size: 14px;
+                        font-weight: bold;
+                        padding: 12px 24px;
+                    }
+                    QPushButton:hover {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #42A5F5, stop: 1 #2196F3);
+                    }
+                    QPushButton:pressed {
+                        background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                    stop: 0 #1976D2, stop: 1 #1565C0);
+                    }
+                """
 
-        # 配置区域
-        config_group = QGroupBox("下载设置")
-        config_layout = QVBoxLayout()
+    class DouyinDownloaderApp(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("抖音图片下载器 - 修正版本")
+            self.setGeometry(800, 400, 1200, 1000)
+            self.setMinimumSize(800, 600)
 
-        # 下载页数设置
-        pages_layout = QHBoxLayout()
-        pages_layout.addWidget(QLabel("采集页数:"))
-        self.pages_input = QLineEdit("5")
-        self.pages_input.setMaximumWidth(50)
-        pages_layout.addWidget(self.pages_input)
-        pages_layout.addStretch()
-        config_layout.addLayout(pages_layout)
+            # 设置窗口样式
+            self.setStyleSheet("""
+                QMainWindow {
+                    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                stop: 0 #667eea, stop: 1 #764ba2);
+                }
+            """)
 
-        # 线程数设置
-        threads_layout = QHBoxLayout()
-        threads_layout.addWidget(QLabel("下载线程数:"))
-        self.threads_input = QLineEdit("5")
-        self.threads_input.setMaximumWidth(50)
-        threads_layout.addWidget(self.threads_input)
-        threads_layout.addStretch()
-        config_layout.addLayout(threads_layout)
+            self.init_ui()
+            self.download_thread = None
 
-        # 下载目录设置
-        dir_layout = QHBoxLayout()
-        dir_layout.addWidget(QLabel("下载目录:"))
-        self.dir_input = QLineEdit(DOWNLOAD_FOLDER)
-        dir_layout.addWidget(self.dir_input)
-        self.browse_btn = QPushButton("浏览...")
-        self.browse_btn.setMaximumWidth(80)
-        self.browse_btn.clicked.connect(self.browse_directory)
-        dir_layout.addWidget(self.browse_btn)
-        config_layout.addLayout(dir_layout)
+        def init_ui(self):
+            """初始化用户界面 - 简化版本"""
+            main_widget = QWidget()
+            main_layout = QVBoxLayout()
+            main_layout.setSpacing(20)
+            main_layout.setContentsMargins(30, 30, 30, 30)
 
-        # 跳过已下载选项
-        self.skip_downloaded = QCheckBox("跳过已下载的图片")
-        self.skip_downloaded.setChecked(True)
-        config_layout.addWidget(self.skip_downloaded)
+            # 标题
+            title = QLabel("🎵 抖音图片下载器")
+            title.setFont(QFont("Arial", 28, QFont.Bold))  # 调大标题字号
+            title.setAlignment(Qt.AlignCenter)
+            title.setStyleSheet("color: white; margin: 20px;")
+            main_layout.addWidget(title)
 
-        config_group.setLayout(config_layout)
-        main_layout.addWidget(config_group)
+            # 配置区域
+            config_group = QGroupBox("下载设置")
+            config_group.setStyleSheet("""
+                QGroupBox {
+                    font-size: 22px; /* 调大设置区域标题字号 */
+                    font-weight: bold;
+                    color: #2c3e50;
+                    border: 2px solid #e0e0e0;
+                    border-radius: 10px;
+                    margin-top: 10px;
+                    padding-top: 35px; /* 标题再下移 */
+                    background: rgba(255, 255, 255, 0.9);
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 0px; /* 靠近左上角 */
+                    top: 24px; /* 标题再下移 */
+                    padding: 0 10px 0 10px;
+                    font-size: 22px; /* 标题字号加大 */
+                }
+            """)
+            config_layout = QVBoxLayout()
 
-        # 进度条
-        self.progress_label = QLabel("准备开始...")
-        self.progress_label.setStyleSheet("font-weight: bold;")
-        main_layout.addWidget(self.progress_label)
+            # 设置输入
+            settings_layout = QHBoxLayout()
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.progress_bar)
+            settings_layout.addWidget(QLabel("采集页数:"))
+            self.pages_input = QLineEdit("5")
+            self.pages_input.setMaximumWidth(60)
+            self.pages_input.setFont(QFont("Arial", 14))  # 调大输入框字号
+            settings_layout.addWidget(self.pages_input)
 
-        # 控制按钮
-        btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("开始下载")
-        self.start_btn.setStyleSheet("background-color: #2ecc71; color: white; padding: 8px;")
-        self.start_btn.clicked.connect(self.start_download)
-        btn_layout.addWidget(self.start_btn)
+            settings_layout.addWidget(QLabel("线程数:"))
+            self.threads_input = QLineEdit("5")
+            self.threads_input.setMaximumWidth(60)
+            self.threads_input.setFont(QFont("Arial", 14))  # 调大输入框字号
+            settings_layout.addWidget(self.threads_input)
 
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setStyleSheet("background-color: #e74c3c; color: white; padding: 8px;")
-        self.stop_btn.clicked.connect(self.stop_download)
-        self.stop_btn.setEnabled(False)
-        btn_layout.addWidget(self.stop_btn)
+            # 新增：滚动类名输入
+            settings_layout.addWidget(QLabel("滚动类名:"))
+            self.scroll_class_input = QLineEdit("gqga5U3W")
+            self.scroll_class_input.setMaximumWidth(120)
+            self.scroll_class_input.setFont(QFont("Arial", 8))
+            settings_layout.addWidget(self.scroll_class_input)
 
-        main_layout.addLayout(btn_layout)
+            settings_layout.addStretch()
+            config_layout.addLayout(settings_layout)
 
-        # 日志区域
-        log_group = QGroupBox("操作日志")
-        log_layout = QVBoxLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("font-family: Consolas, Courier;")
-        log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        main_layout.addWidget(log_group)
+            # 目录选择
+            dir_layout = QHBoxLayout()
+            dir_layout.addWidget(QLabel("下载目录:"))
+            self.dir_input = QLineEdit(DOWNLOAD_FOLDER)
+            self.dir_input.setFont(QFont("Arial", 14))  # 调大输入框字号
+            dir_layout.addWidget(self.dir_input)
 
-        main_widget.setLayout(main_layout)
-        self.setCentralWidget(main_widget)
+            self.browse_btn = QPushButton("浏览")
+            self.browse_btn.clicked.connect(self.browse_directory)
+            dir_layout.addWidget(self.browse_btn)
+            config_layout.addLayout(dir_layout)
 
-        # 状态栏
-        self.statusBar().showMessage("准备就绪")
+            config_group.setLayout(config_layout)
+            main_layout.addWidget(config_group)
 
-    def browse_directory(self):
-        """选择下载目录"""
-        global DOWNLOAD_FOLDER  # 提前使用 global 声明
-        directory = QFileDialog.getExistingDirectory(self, "选择下载目录", DOWNLOAD_FOLDER)
-        if directory:
-            DOWNLOAD_FOLDER = directory
-            self.dir_input.setText(directory)
+            # 进度条
+            self.progress_label = QLabel("准备开始...")
+            self.progress_label.setStyleSheet("color: white; font-weight: bold; font-size: 18px;")  # 调大进度标签字号
+            main_layout.addWidget(self.progress_label)
 
-    def start_download(self):
-        """开始下载过程"""
-        global DOWNLOAD_FOLDER  # 提前使用 global 声明
-        DOWNLOAD_FOLDER = self.dir_input.text()
-        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 2px solid grey;
+                    border-radius: 5px;
+                    text-align: center;
+                    font-size: 16px; /* 调大进度条字号 */
+                }
+                QProgressBar::chunk {
+                    background-color: #4CAF50;
+                    border-radius: 3px;
+                }
+            """)
+            main_layout.addWidget(self.progress_bar)
 
-        # 获取设置
-        try:
-            max_pages = int(self.pages_input.text())
-            max_threads = int(self.threads_input.text())
-        except ValueError:
-            self.log_text.append("错误：页数和线程数必须是整数")
-            return
+            # 控制按钮
+            btn_layout = QHBoxLayout()
 
-        # 更新UI状态
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("正在初始化...")
+            if PYQT_AVAILABLE:
+                self.start_btn = ModernButton("🚀 开始下载", "primary")
+                self.start_btn.setFont(QFont("Arial", 16))  # 调大按钮字号
+                self.stop_btn = ModernButton("⏹️ 停止", "danger")
+                self.stop_btn.setFont(QFont("Arial", 16))  # 调大按钮字号
+            else:
+                self.start_btn = QPushButton("开始下载")
+                self.start_btn.setFont(QFont("Arial", 20))
+                self.stop_btn = QPushButton("停止")
+                self.stop_btn.setFont(QFont("Arial", 20))
 
-        # 创建并启动下载线程
-        self.download_thread = DownloadThread(max_pages, max_threads)
-        self.download_thread.update_log.connect(self.update_log)
-        self.download_thread.update_progress.connect(self.update_progress)
-        self.download_thread.finished.connect(self.download_finished)
-        self.download_thread.error.connect(self.show_error)
-        self.download_thread.start()
+            self.start_btn.clicked.connect(self.start_download)
+            self.stop_btn.clicked.connect(self.stop_download)
+            self.stop_btn.setEnabled(False)
 
-    def stop_download(self):
-        """停止下载过程"""
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.terminate()
-            self.log_text.append("下载已停止")
-            self.progress_label.setText("下载已停止")
+            btn_layout.addWidget(self.start_btn)
+            btn_layout.addWidget(self.stop_btn)
+            main_layout.addLayout(btn_layout)
+
+            # 日志区域
+            log_group = QGroupBox("操作日志")
+            log_group.setStyleSheet("""
+                QGroupBox {
+                    font-size: 22px; /* 调大设置区域标题字号 */
+                    font-weight: bold;
+                    color: #2c3e50;
+                    border: 2px solid #e0e0e0;
+                    border-radius: 10px;
+                    margin-top: 10px;
+                    padding-top: 35px; /* 标题再下移 */
+                    background: rgba(255, 255, 255, 0.9);
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 0px; /* 靠近左上角 */
+                    top: 24px; /* 标题再下移 */
+                    padding: 0 10px 0 10px;
+                    font-size: 22px; /* 标题字号加大 */
+                }
+            """)
+            log_layout = QVBoxLayout()
+
+            self.log_text = QTextEdit()
+            self.log_text.setReadOnly(True)
+            self.log_text.setStyleSheet("""
+                QTextEdit {
+                    background: white;
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                    padding: 10px;
+                    font-family: Consolas, monospace;
+                    font-size: 24px; /* 日志输出字体更大 */
+                }
+            """)
+            log_layout.addWidget(self.log_text)
+            log_group.setLayout(log_layout)
+            main_layout.addWidget(log_group)
+
+            main_widget.setLayout(main_layout)
+            self.setCentralWidget(main_widget)
+
+        def browse_directory(self):
+            """选择下载目录"""
+            global DOWNLOAD_FOLDER
+            directory = QFileDialog.getExistingDirectory(self, "选择下载目录", DOWNLOAD_FOLDER)
+            if directory:
+                DOWNLOAD_FOLDER = directory
+                self.dir_input.setText(directory)
+
+        def start_download(self):
+            """开始下载过程"""
+            if not DRISSION_AVAILABLE:
+                self.log_text.append("❌ 错误：DrissionPage未安装，无法进行下载")
+                self.log_text.append("   安装命令: pip install DrissionPage")
+                return
+
+            global DOWNLOAD_FOLDER
+            DOWNLOAD_FOLDER = self.dir_input.text()
+            os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+            try:
+                max_pages = int(self.pages_input.text())
+                max_threads = int(self.threads_input.text())
+                scroll_class = self.scroll_class_input.text().strip() or "gqga5U3W"
+            except ValueError:
+                self.log_text.append("❌ 错误：页数和线程数必须是整数")
+                return
+
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("🔄 正在初始化...")
+
+            self.download_thread = DownloadThread(max_pages, max_threads)
+            # 传递滚动类名
+            self.download_thread.downloader.scroll_class = scroll_class
+            self.download_thread.update_log.connect(self.update_log)
+            self.download_thread.finished.connect(self.download_finished)
+            self.download_thread.error.connect(self.show_error)
+            self.download_thread.start()
+
+        def stop_download(self):
+            """停止下载过程"""
+            if self.download_thread and self.download_thread.isRunning():
+                self.download_thread.terminate()
+                self.log_text.append("⏹️ 下载已停止")
+                self.progress_label.setText("⏹️ 下载已停止")
+                self.start_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+
+        def update_log(self, message):
+            """更新日志显示"""
+            self.log_text.append(message)
+            self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+        def download_finished(self, success, fail):
+            """下载完成处理"""
+            self.progress_bar.setValue(100)
+            self.progress_label.setText(f"🎉 下载完成! 成功: {success}, 失败: {fail}")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.log_text.append(f"🎉 下载完成! 成功 {success} 张，失败 {fail} 张")
+
+        def show_error(self, message):
+            """显示错误信息"""
+            self.log_text.append(f"❌ {message}")
+            self.progress_label.setText("❌ 下载出错")
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
 
-    def update_log(self, message):
-        """更新日志显示"""
-        self.log_text.append(message)
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
 
-    def update_progress(self, current, total, success):
-        """更新进度条"""
-        if total > 0:
-            progress = int((current / total) * 100)
-            self.progress_bar.setValue(progress)
-            self.progress_label.setText(f"正在下载: {current}/{total} (成功: {success})")
+def run_cli_mode():
+    """运行命令行模式"""
+    print("🎵 抖音图片下载器 - 命令行模式")
+    print("(GUI模式不可用，PyQt5未安装)")
+    print("=" * 50)
 
-    def download_finished(self, success, fail):
-        """下载完成处理"""
-        self.progress_bar.setValue(100)
-        self.progress_label.setText(f"下载完成! 成功: {success}, 失败: {fail}")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.log_text.append(f"下载完成! 成功下载 {success} 张图片，失败 {fail} 张")
+    if not DRISSION_AVAILABLE:
+        print("❌ DrissionPage未安装，无法使用浏览器自动化功能")
+        print("   安装命令: pip install DrissionPage")
+        return
 
-    def show_error(self, message):
-        """显示错误信息"""
-        self.log_text.append(f"<font color='red'>{message}</font>")
-        self.progress_label.setText("下载出错")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+    try:
+        max_pages = input("📄 请输入采集页数 (默认: 5): ").strip()
+        max_pages = int(max_pages) if max_pages else 5
+
+        max_threads = input("🧵 请输入下载线程数 (默认: 5): ").strip()
+        max_threads = int(max_threads) if max_threads else 5
+
+    except ValueError:
+        print("❌ 输入错误，使用默认值")
+        max_pages = 5
+        max_threads = 5
+
+    downloader = DouyinImageDownloader()
+    success, fail = downloader.start_download(max_pages, max_threads)
+
+    print(f"\n🎉 下载完成!")
+    print(f"   ✅ 成功: {success} 张")
+    print(f"   ❌ 失败: {fail} 张")
+
+
+def main():
+    """主函数 - 自动选择GUI或命令行模式"""
+    if PYQT_AVAILABLE:
+        # GUI模式
+        app = QApplication(sys.argv)
+        app.setStyle('Fusion')
+
+        window = DouyinDownloaderApp()
+        window.show()
+
+        sys.exit(app.exec_())
+    else:
+        # 命令行模式
+        run_cli_mode()
 
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = DouyinDownloaderApp()
-    window.show()
-    sys.exit(app.exec_())
+    main()
